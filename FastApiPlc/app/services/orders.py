@@ -5,15 +5,15 @@ from typing import Any
 from uuid import uuid4
 
 from app.schemas import (
-    AVAILABLE_TAGS,
-    ActualWpcInfo,
+    ActiveOperation,
     Color,
-    Decision,
-    OperationState,
-    OrderCreateRequest,
-    OrderItemStatus,
-    OrderRead,
+    ErpEventType,
+    IntegrationEventRead,
+    LoadToHmiRequest,
+    LoadedOrderRead,
+    OrderColor,
     OrderStatus,
+    RecipeRead,
 )
 from app.storage.json_store import JsonStore
 
@@ -26,162 +26,264 @@ def now_iso() -> str:
     return now_utc().isoformat()
 
 
-def parse_actual_wpc(actual_wpc: int) -> ActualWpcInfo:
-    cap_detected = actual_wpc >= 10
-    color_code = actual_wpc - 10 if cap_detected else actual_wpc
+def parse_actual_wpc(actual_wpc: int) -> Color:
     color_by_code = {1: Color.black, 2: Color.red, 3: Color.silver}
-    color = color_by_code.get(color_code)
+    color = color_by_code.get(actual_wpc)
     if color is None:
-        raise ValueError("ActualWPC must be one of: 1, 2, 3, 11, 12, 13")
-    return ActualWpcInfo(actual_wpc=actual_wpc, color=color, cap_detected=cap_detected)
+        raise ValueError("ActualWPC must be one of: 1 black, 2 red, 3 silver")
+    return color
 
 
 class OrderService:
     def __init__(self, store: JsonStore) -> None:
         self.store = store
 
-    async def create_order(self, request: OrderCreateRequest) -> OrderRead:
+    async def load_to_hmi(self, request: LoadToHmiRequest) -> LoadedOrderRead:
         created_at = now_iso()
         order_id = str(uuid4())
-        units: list[dict[str, Any]] = []
-        sequence = 1
-
-        for line_index, product in enumerate(request.items, start=1):
-            for _ in range(product.quantity):
-                units.append(
-                    {
-                        "id": str(uuid4()),
-                        "source_line": line_index,
-                        "sequence": sequence,
-                        "color": product.color.value,
-                        "tags": product.tags,
-                        "cap": product.cap,
-                        "status": OrderItemStatus.pending.value,
-                        "started_at": None,
-                        "completed_at": None,
-                    }
-                )
-                sequence += 1
-
+        recipes = {
+            item.color.value: {
+                "line_number": item.line_number,
+                "color": item.color.value,
+                "tags": item.tags,
+                "cap": item.cap,
+                "required": item.quantity,
+                "started": 0,
+                "completed": 0,
+            }
+            for item in request.items
+        }
         order = {
             "id": order_id,
-            "document_number": request.document_number,
+            "customer_order_number": request.customer_order_number,
+            "customer_order_ref": request.customer_order_ref,
+            "customer": request.customer,
+            "status": OrderStatus.running.value,
             "created_at": created_at,
-            "items": units,
+            "completed_at": None,
+            "recipes": recipes,
+            "active_operation": None,
+            "rejected_count": 0,
+            "completion_notified": False,
         }
 
-        def mutator(data: dict[str, Any]) -> OrderRead:
+        def mutator(data: dict[str, Any]) -> LoadedOrderRead:
+            active = self._active_order_raw(data)
+            if active and active["status"] == OrderStatus.running.value:
+                raise ValueError("Another customer order is already running on the stand")
             data["orders"].append(order)
             return self._to_order_read(order)
 
         return await self.store.update(mutator)
 
-    async def list_orders(self) -> list[OrderRead]:
+    async def list_orders(self) -> list[LoadedOrderRead]:
         data = await self.store.load()
         return [self._to_order_read(order) for order in data["orders"]]
 
-    async def get_order(self, order_id: str) -> OrderRead | None:
+    async def get_order(self, order_id: str) -> LoadedOrderRead | None:
         data = await self.store.load()
         for order in data["orders"]:
             if order["id"] == order_id:
                 return self._to_order_read(order)
         return None
 
-    async def reserve_next_for_wpc(self, info: ActualWpcInfo) -> OperationState:
+    async def active_order(self) -> LoadedOrderRead | None:
+        data = await self.store.load()
+        order = self._active_order_raw(data)
+        return self._to_order_read(order) if order else None
+
+    async def handle_color_detected(self, actual_wpc: int) -> tuple[ActiveOperation, dict[str, Any] | None]:
+        color = parse_actual_wpc(actual_wpc)
         created_at = now_iso()
 
-        def mutator(data: dict[str, Any]) -> OperationState:
-            for order in data["orders"]:
-                for item in order["items"]:
-                    if item["status"] == OrderItemStatus.pending.value and item["color"] == info.color.value:
-                        item["status"] = OrderItemStatus.processing.value
-                        item["started_at"] = created_at
-                        return OperationState(
-                            id=str(uuid4()),
-                            decision=Decision.accepted,
-                            actual_wpc=info.actual_wpc,
-                            color=info.color,
-                            cap_detected=info.cap_detected,
-                            order_id=order["id"],
-                            item_id=item["id"],
-                            created_at=datetime.fromisoformat(created_at),
-                        )
+        def mutator(data: dict[str, Any]) -> tuple[ActiveOperation, dict[str, Any] | None]:
+            order = self._active_order_raw(data)
+            if not order:
+                return self._reject_operation(actual_wpc, color, created_at, "no_active_order"), None
+            if order.get("active_operation"):
+                raise ValueError("Previous container is still active")
 
-            reject = {
-                "id": str(uuid4()),
-                "actual_wpc": info.actual_wpc,
-                "color": info.color.value,
-                "cap_detected": info.cap_detected,
-                "created_at": created_at,
-                "completed_at": None,
-            }
-            data["rejects"].append(reject)
-            return OperationState(
-                id=reject["id"],
-                decision=Decision.rejected,
-                actual_wpc=info.actual_wpc,
-                color=info.color,
-                cap_detected=info.cap_detected,
+            recipe = order["recipes"].get(color.value)
+            if color == Color.silver or not recipe:
+                operation = self._reject_operation(actual_wpc, color, created_at, "color_not_in_customer_order")
+                order["active_operation"] = operation.model_dump(mode="json")
+                return operation, None
+
+            if recipe["started"] >= recipe["required"]:
+                operation = self._reject_operation(actual_wpc, color, created_at, "color_quantity_already_completed")
+                order["active_operation"] = operation.model_dump(mode="json")
+                return operation, None
+
+            unit_sequence = sum(item["started"] for item in order["recipes"].values()) + 1
+            recipe["started"] += 1
+            operation = ActiveOperation(
+                id=str(uuid4()),
+                decision="accepted",
+                actual_wpc=actual_wpc,
+                color=color,
                 created_at=datetime.fromisoformat(created_at),
+                unit_sequence=unit_sequence,
+                tags=recipe["tags"],
+                cap=recipe["cap"],
             )
+            order["active_operation"] = operation.model_dump(mode="json")
+            payload = {
+                "event_id": f"EVT-{uuid4()}",
+                "fastapi_order_id": order["id"],
+                "customer_order_number": order["customer_order_number"],
+                "color": color.value,
+                "tags": recipe["tags"],
+                "cap": recipe["cap"],
+                "unit_sequence": unit_sequence,
+            }
+            return operation, payload
 
         return await self.store.update(mutator)
 
-    async def complete_operation(self, operation: OperationState) -> OperationState:
+    async def handle_finished_tray(self) -> dict[str, Any] | None:
+        finished_at = now_iso()
+
+        def mutator(data: dict[str, Any]) -> dict[str, Any] | None:
+            order = self._active_order_raw(data)
+            if not order or not order.get("active_operation"):
+                return None
+
+            operation = order["active_operation"]
+            if operation["decision"] != "accepted":
+                return None
+
+            recipe = order["recipes"][operation["color"]]
+            recipe["completed"] += 1
+            order["active_operation"] = None
+
+            if self._order_totals(order)["completed"] >= self._order_totals(order)["required"]:
+                order["status"] = OrderStatus.completed.value
+                order["completed_at"] = finished_at
+                if not order.get("completion_notified"):
+                    order["completion_notified"] = True
+                    return {
+                        "event_id": f"EVT-{uuid4()}",
+                        "fastapi_order_id": order["id"],
+                        "customer_order_number": order["customer_order_number"],
+                        "completed": {
+                            color: recipe["completed"] for color, recipe in order["recipes"].items()
+                        },
+                        "rejected_count": order["rejected_count"],
+                    }
+            return None
+
+        return await self.store.update(mutator)
+
+    async def handle_reject_tray(self) -> None:
         completed_at = now_iso()
 
-        def mutator(data: dict[str, Any]) -> OperationState:
-            if operation.decision == Decision.accepted and operation.order_id and operation.item_id:
-                for order in data["orders"]:
-                    if order["id"] != operation.order_id:
-                        continue
-                    for item in order["items"]:
-                        if item["id"] == operation.item_id:
-                            item["status"] = OrderItemStatus.completed.value
-                            item["completed_at"] = completed_at
-                            break
-            else:
-                for reject in data["rejects"]:
-                    if reject["id"] == operation.id:
-                        reject["completed_at"] = completed_at
-                        break
+        def mutator(data: dict[str, Any]) -> None:
+            order = self._active_order_raw(data)
+            if order and order.get("active_operation") and order["active_operation"]["decision"] == "rejected":
+                operation = order["active_operation"]
+                order["rejected_count"] += 1
+                order["active_operation"] = None
+                data["rejects"].append(
+                    {
+                        "id": operation["id"],
+                        "actual_wpc": operation["actual_wpc"],
+                        "color": operation["color"],
+                        "reject_reason": operation.get("reject_reason"),
+                        "created_at": operation["created_at"],
+                        "completed_at": completed_at,
+                    }
+                )
 
-            return operation.model_copy(update={"completed_at": datetime.fromisoformat(completed_at)})
+        await self.store.update(mutator)
+
+    async def create_integration_event(self, event_type: ErpEventType, payload: dict[str, Any]) -> IntegrationEventRead:
+        event = {
+            "id": str(uuid4()),
+            "event_type": event_type.value,
+            "payload": payload,
+            "status": "pending",
+            "created_at": now_iso(),
+            "sent_at": None,
+            "error": None,
+        }
+
+        def mutator(data: dict[str, Any]) -> IntegrationEventRead:
+            data["integration_events"].append(event)
+            return self._to_integration_event(event)
 
         return await self.store.update(mutator)
 
-    async def rejected_count(self) -> int:
+    async def mark_integration_event(self, event_id: str, status: str, error: str | None = None) -> None:
+        sent_at = now_iso() if status in {"sent", "skipped"} else None
+
+        def mutator(data: dict[str, Any]) -> None:
+            for event in data["integration_events"]:
+                if event["id"] == event_id:
+                    event["status"] = status
+                    event["sent_at"] = sent_at
+                    event["error"] = error
+                    break
+
+        await self.store.update(mutator)
+
+    async def list_integration_events(self) -> list[IntegrationEventRead]:
         data = await self.store.load()
-        return len(data["rejects"])
+        return [self._to_integration_event(event) for event in data["integration_events"]]
 
-    def _to_order_read(self, order: dict[str, Any]) -> OrderRead:
-        items = order["items"]
-        total = len(items)
-        pending = sum(1 for item in items if item["status"] == OrderItemStatus.pending.value)
-        processing = sum(1 for item in items if item["status"] == OrderItemStatus.processing.value)
-        completed = sum(1 for item in items if item["status"] == OrderItemStatus.completed.value)
-
-        if completed == total:
-            status = OrderStatus.completed
-        elif completed or processing:
-            status = OrderStatus.in_progress
-        else:
-            status = OrderStatus.pending
-
-        return OrderRead(
-            id=order["id"],
-            document_number=order["document_number"],
-            status=status,
-            created_at=datetime.fromisoformat(order["created_at"]),
-            total_items=total,
-            pending_items=pending,
-            processing_items=processing,
-            completed_items=completed,
-            items=items,
+    def _reject_operation(self, actual_wpc: int, color: Color, created_at: str, reason: str) -> ActiveOperation:
+        return ActiveOperation(
+            id=str(uuid4()),
+            decision="rejected",
+            actual_wpc=actual_wpc,
+            color=color,
+            created_at=datetime.fromisoformat(created_at),
+            reject_reason=reason,
         )
 
+    def _active_order_raw(self, data: dict[str, Any]) -> dict[str, Any] | None:
+        for order in reversed(data["orders"]):
+            if order["status"] == OrderStatus.running.value:
+                return order
+        return None
 
-def tags_warning(tags: int) -> str | None:
-    if tags > AVAILABLE_TAGS:
-        return f"Запрошено {tags} фишек, физически сейчас доступно {AVAILABLE_TAGS}."
-    return None
+    def _order_totals(self, order: dict[str, Any]) -> dict[str, int]:
+        recipes = order["recipes"].values()
+        return {
+            "required": sum(recipe["required"] for recipe in recipes),
+            "started": sum(recipe["started"] for recipe in order["recipes"].values()),
+            "completed": sum(recipe["completed"] for recipe in order["recipes"].values()),
+        }
+
+    def _to_order_read(self, order: dict[str, Any]) -> LoadedOrderRead:
+        totals = self._order_totals(order)
+        recipes = {
+            OrderColor(color): RecipeRead(**recipe) for color, recipe in order["recipes"].items()
+        }
+        active_operation = order.get("active_operation")
+        return LoadedOrderRead(
+            id=order["id"],
+            customer_order_number=order["customer_order_number"],
+            customer_order_ref=order.get("customer_order_ref"),
+            customer=order["customer"],
+            status=OrderStatus(order["status"]),
+            created_at=datetime.fromisoformat(order["created_at"]),
+            completed_at=datetime.fromisoformat(order["completed_at"]) if order.get("completed_at") else None,
+            recipes=recipes,
+            total_required=totals["required"],
+            total_started=totals["started"],
+            total_completed=totals["completed"],
+            rejected_count=order["rejected_count"],
+            active_operation=ActiveOperation(**active_operation) if active_operation else None,
+            completion_notified=order.get("completion_notified", False),
+        )
+
+    def _to_integration_event(self, event: dict[str, Any]) -> IntegrationEventRead:
+        return IntegrationEventRead(
+            id=event["id"],
+            event_type=ErpEventType(event["event_type"]),
+            payload=event["payload"],
+            status=event["status"],
+            created_at=datetime.fromisoformat(event["created_at"]),
+            sent_at=datetime.fromisoformat(event["sent_at"]) if event.get("sent_at") else None,
+            error=event.get("error"),
+        )

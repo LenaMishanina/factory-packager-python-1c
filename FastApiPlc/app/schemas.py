@@ -2,20 +2,23 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import Any, Literal
+from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
-SIEMENS_INT_MIN = -32768
-SIEMENS_INT_MAX = 32767
-AVAILABLE_TAGS = 5
+MAX_TAGS = 3
 
 
 class Color(str, Enum):
     black = "black"
     red = "red"
     silver = "silver"
+
+
+class OrderColor(str, Enum):
+    black = "black"
+    red = "red"
 
 
 COLOR_ALIASES = {
@@ -39,6 +42,8 @@ COLOR_ALIASES = {
 def normalize_color(value: Any) -> Color:
     if isinstance(value, Color):
         return value
+    if isinstance(value, OrderColor):
+        return Color(value.value)
     if isinstance(value, str):
         key = value.strip().lower()
         if key in COLOR_ALIASES:
@@ -46,102 +51,103 @@ def normalize_color(value: Any) -> Color:
     raise ValueError("Color must be black/red/silver or черная/красная/серебристая")
 
 
+def normalize_order_color(value: Any) -> OrderColor:
+    color = normalize_color(value)
+    if color == Color.silver:
+        raise ValueError("Silver products are disabled for this stand scenario")
+    return OrderColor(color.value)
+
+
 class ApiResponse(BaseModel):
     success: bool = Field(..., examples=[True])
-    message: str = Field(..., examples=["Заказ клиента был добавлен"])
+    message: str = Field(..., examples=["Операция выполнена успешно"])
     data: Any | None = None
 
 
-class OrderProductRequest(BaseModel):
-    color: Color = Field(..., description="Цвет емкости: black/red/silver или русское значение")
-    tags: int = Field(
-        0,
-        ge=SIEMENS_INT_MIN,
-        le=SIEMENS_INT_MAX,
-        description="Количество фишек в диапазоне Siemens Int. Физически сейчас доступно 5.",
-    )
+class OrderLineRequest(BaseModel):
+    line_number: int = Field(..., ge=1, description="Номер строки в заказе клиента")
+    color: OrderColor = Field(..., description="Цвет изделия: black/red")
+    tags: int = Field(0, ge=0, le=MAX_TAGS, description="Количество фишек от 0 до 3")
     cap: bool = Field(False, description="Нужно ли закрыть емкость крышкой")
-    quantity: int = Field(1, ge=1, description="Количество одинаковых изделий в заказе")
+    quantity: int = Field(1, ge=1, description="Количество изделий с данным рецептом")
 
     @field_validator("color", mode="before")
     @classmethod
-    def validate_color(cls, value: Any) -> Color:
-        return normalize_color(value)
+    def validate_color(cls, value: Any) -> OrderColor:
+        return normalize_order_color(value)
 
 
-class OrderCreateRequest(BaseModel):
-    document_number: str = Field(..., min_length=1, description="Номер документа «Заказ клиента» в 1C")
-    items: list[OrderProductRequest] = Field(..., min_length=1, description="Позиции заказа клиента")
+class LoadToHmiRequest(BaseModel):
+    customer_order_number: str = Field(..., min_length=1, description="Номер документа «Заказ клиента»")
+    customer_order_ref: str | None = Field(None, description="Ссылка 1C на «Заказ клиента»")
+    customer: str = Field("Учебный клиент", min_length=1, description="Клиент заказа")
+    items: list[OrderLineRequest] = Field(..., min_length=1, description="Позиции заказа")
+
+    @model_validator(mode="after")
+    def validate_single_recipe_per_color(self) -> LoadToHmiRequest:
+        seen: set[OrderColor] = set()
+        for item in self.items:
+            if item.color in seen:
+                raise ValueError("Only one recipe per color is allowed in one customer order")
+            seen.add(item.color)
+        return self
 
 
-class OrderItemStatus(str, Enum):
-    pending = "pending"
-    processing = "processing"
-    completed = "completed"
+class RecipeRead(BaseModel):
+    line_number: int
+    color: OrderColor
+    tags: int
+    cap: bool
+    required: int
+    started: int
+    completed: int
 
 
 class OrderStatus(str, Enum):
-    pending = "pending"
-    in_progress = "in_progress"
+    running = "running"
     completed = "completed"
+    stopped = "stopped"
 
 
-class OrderUnit(BaseModel):
+class ActiveOperation(BaseModel):
     id: str
-    source_line: int
-    sequence: int
+    decision: str
+    actual_wpc: int
     color: Color
-    tags: int
-    cap: bool
-    status: OrderItemStatus
-    started_at: datetime | None = None
-    completed_at: datetime | None = None
+    created_at: datetime
+    unit_sequence: int | None = None
+    tags: int | None = None
+    cap: bool | None = None
+    reject_reason: str | None = None
 
 
-class OrderRead(BaseModel):
+class LoadedOrderRead(BaseModel):
     id: str
-    document_number: str
+    customer_order_number: str
+    customer_order_ref: str | None = None
+    customer: str
     status: OrderStatus
     created_at: datetime
-    total_items: int
-    pending_items: int
-    processing_items: int
-    completed_items: int
-    items: list[OrderUnit]
+    completed_at: datetime | None = None
+    recipes: dict[OrderColor, RecipeRead]
+    total_required: int
+    total_started: int
+    total_completed: int
+    rejected_count: int
+    active_operation: ActiveOperation | None = None
+    completion_notified: bool = False
 
 
 class ActualWpcRequest(BaseModel):
-    actual_wpc: int = Field(..., description="ActualWPC из Hmi: 1/11 black, 2/12 red, 3/13 silver")
-
-
-class ActualWpcInfo(BaseModel):
-    actual_wpc: int
-    color: Color
-    cap_detected: bool
+    actual_wpc: int = Field(..., description="ActualWPC из Hmi: 1 black, 2 red, 3 silver")
 
 
 class CompleteRequest(BaseModel):
-    counter_pip: bool = Field(
-        True,
-        description="Имитация датчика завершения. True означает, что емкость дошла до лотка.",
-    )
+    counter_pip: bool = Field(True, description="Совместимость со старой симуляцией завершения")
 
 
-class Decision(str, Enum):
-    accepted = "accepted"
-    rejected = "rejected"
-
-
-class OperationState(BaseModel):
-    id: str
-    decision: Decision
-    actual_wpc: int
-    color: Color
-    cap_detected: bool
-    order_id: str | None = None
-    item_id: str | None = None
-    created_at: datetime
-    completed_at: datetime | None = None
+class EventCounterRequest(BaseModel):
+    value: int | None = Field(None, description="Опциональное явное значение счетчика")
 
 
 class HmiState(BaseModel):
@@ -156,6 +162,9 @@ class HmiState(BaseModel):
     RedCap: bool = False
     SilverCap: bool = False
     ActualWPC: int = 0
+    ColorDetectedCounter: int = 0
+    FinishedTrayCounter: int = 0
+    RejectTrayCounter: int = 0
     calibrated: bool = False
 
 
@@ -169,6 +178,19 @@ class DbMyDataState(BaseModel):
 class PlcState(BaseModel):
     hmi: HmiState
     db_my_data: DbMyDataState
-    current_operation: OperationState | None = None
-    rejected_count: int = 0
-    available_tags: Literal[5] = AVAILABLE_TAGS
+    current_operation: ActiveOperation | None = None
+
+
+class ErpEventType(str, Enum):
+    production_unit_start = "production_unit_start"
+    customer_order_complete = "customer_order_complete"
+
+
+class IntegrationEventRead(BaseModel):
+    id: str
+    event_type: ErpEventType
+    payload: dict[str, Any]
+    status: str
+    created_at: datetime
+    sent_at: datetime | None = None
+    error: str | None = None

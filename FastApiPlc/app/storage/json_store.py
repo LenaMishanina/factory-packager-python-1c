@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_DATA = {"orders": [], "rejects": []}
+DEFAULT_DATA = {"orders": [], "rejects": [], "integration_events": []}
 
 
 class JsonStore:
@@ -39,6 +39,7 @@ class JsonStore:
             data = json.load(file)
         data.setdefault("orders", [])
         data.setdefault("rejects", [])
+        data.setdefault("integration_events", [])
         return data
 
     def _save_unlocked(self, data: dict[str, Any]) -> None:
