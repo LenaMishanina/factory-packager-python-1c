@@ -73,7 +73,11 @@ def create_app(
 
     store = JsonStore(storage_path or ROOT / "data" / "orders.json")
     app.state.order_service = OrderService(store)
-    app.state.erp_client = erp_client or ErpClient(os.getenv("ERP_BASE_URL"))
+    app.state.erp_client = erp_client or ErpClient(
+        os.getenv("ERP_BASE_URL"),
+        username=os.getenv("ERP_USERNAME"),
+        password=os.getenv("ERP_PASSWORD"),
+    )
     app.state.plc = plc or create_plc_from_env()
     app.state.last_color_counter = 0
     app.state.last_finished_counter = 0

@@ -1,0 +1,30 @@
+services:
+  fastapi-plc:
+    build:
+      context: .
+    container_name: fastapi-plc
+    ports:
+      - "8000:8000"
+    environment:
+      PLC_MODE: "${PLC_MODE:-stub}"
+      PLC_POLLING_ENABLED: "${PLC_POLLING_ENABLED:-false}"
+      ERP_BASE_URL: "${ERP_BASE_URL:-http://host.docker.internal/zavodhttp/hs}"
+      ERP_USERNAME: "${ERP_USERNAME:-Администратор}"
+      ERP_PASSWORD: "${ERP_PASSWORD:-}"
+      PLC_HOST: "${PLC_HOST:-192.168.0.1}"
+      PLC_RACK: "${PLC_RACK:-0}"
+      PLC_SLOT: "${PLC_SLOT:-1}"
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).read()",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
