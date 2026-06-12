@@ -19,8 +19,22 @@ class RecordingErpClient:
         return {"status": "ok"}
 
 
-def make_client(tmp_path: Path, erp_client: RecordingErpClient | None = None) -> TestClient:
-    app = create_app(tmp_path / "orders.json", erp_client=erp_client or RecordingErpClient())
+class FailingErpClient:
+    def __init__(self, failing_event_type: ErpEventType, fail_times: int = 1) -> None:
+        self.failing_event_type = failing_event_type
+        self.fail_times = fail_times
+        self.events: list[tuple[ErpEventType, dict[str, Any]]] = []
+
+    async def send_event(self, event_type: ErpEventType, payload: dict[str, Any]) -> dict[str, Any]:
+        self.events.append((event_type, payload))
+        if event_type == self.failing_event_type and self.fail_times > 0:
+            self.fail_times -= 1
+            raise RuntimeError("ERP temporary failure")
+        return {"status": "ok"}
+
+
+def make_client(tmp_path: Path, erp_client: Any | None = None) -> TestClient:
+    app = create_app(tmp_path / "orders.json", erp_client=erp_client or RecordingErpClient(), start_retry=False)
     return TestClient(app)
 
 
@@ -42,6 +56,18 @@ def load_sample_order(client: TestClient) -> str:
     assert body["success"] is True
     assert body["data"]["order"]["total_required"] == 3
     return body["data"]["order"]["id"]
+
+
+def load_single_black_order(client: TestClient) -> str:
+    response = client.post(
+        "/orders/load-to-hmi",
+        json={
+            "customer_order_number": "ORDER-RETRY-1",
+            "items": [{"line_number": 1, "color": "black", "tags": 1, "cap": False, "quantity": 1}],
+        },
+    )
+    assert response.status_code == 201
+    return response.json()["data"]["order"]["id"]
 
 
 def test_load_order_writes_recipes_to_hmi_and_starts_stand(tmp_path: Path) -> None:
@@ -169,11 +195,101 @@ def test_full_physical_flow_stops_stand_and_sends_completion(tmp_path: Path) -> 
     assert erp.events[-1][1]["completed"] == {"black": 2}
 
 
+def test_customer_order_complete_failure_is_scheduled_for_retry(tmp_path: Path) -> None:
+    erp = FailingErpClient(ErpEventType.customer_order_complete, fail_times=1)
+    client = make_client(tmp_path, erp)
+    load_single_black_order(client)
+
+    client.post("/plc/simulate/color-detected", json={"actual_wpc": 1})
+    response = client.post("/plc/simulate/finished-tray", json={})
+
+    assert response.status_code == 200
+    event = response.json()["data"]["completion_event"]
+    assert event["status"] == "retry_pending"
+    assert event["attempts"] == 1
+    assert event["max_attempts"] == 10
+    assert event["next_retry_at"] is not None
+    assert event["error"] == "ERP temporary failure"
+
+    events = client.get("/integration/events").json()["data"]["events"]
+    completion_events = [item for item in events if item["event_type"] == ErpEventType.customer_order_complete]
+    assert len(completion_events) == 1
+    assert completion_events[0]["status"] == "retry_pending"
+    assert completion_events[0]["attempts"] == 1
+
+
+def test_manual_retry_sends_existing_completion_event(tmp_path: Path) -> None:
+    erp = FailingErpClient(ErpEventType.customer_order_complete, fail_times=1)
+    client = make_client(tmp_path, erp)
+    load_single_black_order(client)
+
+    client.post("/plc/simulate/color-detected", json={"actual_wpc": 1})
+    first_response = client.post("/plc/simulate/finished-tray", json={})
+    event_id = first_response.json()["data"]["completion_event"]["id"]
+
+    retry_response = client.post(f"/integration/events/{event_id}/retry")
+
+    assert retry_response.status_code == 200
+    event = retry_response.json()["data"]["event"]
+    assert event["id"] == event_id
+    assert event["status"] == "sent"
+    assert event["attempts"] == 2
+    assert event["next_retry_at"] is None
+    assert event["response"] == {"status": "ok"}
+    completion_payloads = [
+        payload for event_type, payload in erp.events if event_type == ErpEventType.customer_order_complete
+    ]
+    assert len(completion_payloads) == 2
+    assert completion_payloads[1]["event_id"] == completion_payloads[0]["event_id"]
+
+
+def test_customer_order_complete_becomes_permanently_failed_after_max_attempts(tmp_path: Path) -> None:
+    erp = FailingErpClient(ErpEventType.customer_order_complete, fail_times=10)
+    app = create_app(
+        tmp_path / "orders.json",
+        erp_client=erp,
+        start_retry=False,
+        retry_max_attempts=1,
+    )
+    client = TestClient(app)
+    load_single_black_order(client)
+
+    client.post("/plc/simulate/color-detected", json={"actual_wpc": 1})
+    response = client.post("/plc/simulate/finished-tray", json={})
+
+    event = response.json()["data"]["completion_event"]
+    assert event["status"] == "permanently_failed"
+    assert event["attempts"] == 1
+    assert event["max_attempts"] == 1
+    assert event["next_retry_at"] is None
+    assert event["error"] == "ERP temporary failure"
+
+
+def test_production_unit_start_failure_is_not_scheduled_for_retry(tmp_path: Path) -> None:
+    erp = FailingErpClient(ErpEventType.production_unit_start, fail_times=1)
+    client = make_client(tmp_path, erp)
+    load_single_black_order(client)
+
+    response = client.post("/plc/simulate/color-detected", json={"actual_wpc": 1})
+
+    assert response.status_code == 200
+    event = response.json()["data"]["integration_event"]
+    assert event["status"] == "failed"
+    assert event["attempts"] == 1
+    assert event["max_attempts"] == 1
+    assert event["next_retry_at"] is None
+
+    events = client.get("/integration/events").json()["data"]["events"]
+    assert len(events) == 1
+    assert events[0]["event_type"] == ErpEventType.production_unit_start
+    assert events[0]["status"] == "failed"
+
+
 def test_json_store_persists_loaded_orders(tmp_path: Path) -> None:
     client = make_client(tmp_path)
     load_sample_order(client)
 
     store = JsonStore(tmp_path / "orders.json")
-    data = TestClient(create_app(tmp_path / "orders.json")).get("/orders").json()["data"]
+    data = TestClient(create_app(tmp_path / "orders.json", start_retry=False)).get("/orders").json()["data"]
     assert len(data["orders"]) == 1
     assert store.path.exists()

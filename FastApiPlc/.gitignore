@@ -1,6 +1,8 @@
 .venv/
 __pycache__/
 .pytest_cache/
+.coverage
+.run/
 *.pyc
 data/*.json
 data/*.tmp

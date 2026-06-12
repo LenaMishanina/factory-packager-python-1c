@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
 
@@ -196,7 +196,12 @@ class OrderService:
 
         await self.store.update(mutator)
 
-    async def create_integration_event(self, event_type: ErpEventType, payload: dict[str, Any]) -> IntegrationEventRead:
+    async def create_integration_event(
+        self,
+        event_type: ErpEventType,
+        payload: dict[str, Any],
+        max_attempts: int = 1,
+    ) -> IntegrationEventRead:
         event = {
             "id": str(uuid4()),
             "event_type": event_type.value,
@@ -205,6 +210,10 @@ class OrderService:
             "created_at": now_iso(),
             "sent_at": None,
             "error": None,
+            "attempts": 0,
+            "last_attempt_at": None,
+            "next_retry_at": None,
+            "max_attempts": max_attempts,
         }
 
         def mutator(data: dict[str, Any]) -> IntegrationEventRead:
@@ -213,18 +222,103 @@ class OrderService:
 
         return await self.store.update(mutator)
 
-    async def mark_integration_event(self, event_id: str, status: str, error: str | None = None) -> None:
-        sent_at = now_iso() if status in {"sent", "skipped"} else None
+    async def register_integration_attempt(
+        self,
+        event_id: str,
+        default_max_attempts: int = 1,
+    ) -> IntegrationEventRead | None:
+        attempted_at = now_iso()
 
-        def mutator(data: dict[str, Any]) -> None:
-            for event in data["integration_events"]:
-                if event["id"] == event_id:
-                    event["status"] = status
-                    event["sent_at"] = sent_at
-                    event["error"] = error
-                    break
+        def mutator(data: dict[str, Any]) -> IntegrationEventRead | None:
+            event = self._find_integration_event(data, event_id)
+            if event is None:
+                return None
+            self._ensure_integration_event_fields(event, default_max_attempts)
+            event["attempts"] += 1
+            event["last_attempt_at"] = attempted_at
+            return self._to_integration_event(event)
 
-        await self.store.update(mutator)
+        return await self.store.update(mutator)
+
+    async def mark_integration_event_sent(self, event_id: str, status: str) -> IntegrationEventRead | None:
+        sent_at = now_iso()
+
+        def mutator(data: dict[str, Any]) -> IntegrationEventRead | None:
+            event = self._find_integration_event(data, event_id)
+            if event is None:
+                return None
+            self._ensure_integration_event_fields(event)
+            event["status"] = status
+            event["sent_at"] = sent_at
+            event["error"] = None
+            event["next_retry_at"] = None
+            return self._to_integration_event(event)
+
+        return await self.store.update(mutator)
+
+    async def mark_integration_event_failed(
+        self,
+        event_id: str,
+        error: str,
+        *,
+        retryable: bool,
+        retry_interval_seconds: int,
+    ) -> IntegrationEventRead | None:
+        retry_at = now_utc() + timedelta(seconds=retry_interval_seconds)
+
+        def mutator(data: dict[str, Any]) -> IntegrationEventRead | None:
+            event = self._find_integration_event(data, event_id)
+            if event is None:
+                return None
+            self._ensure_integration_event_fields(event)
+            event["error"] = error
+            event["sent_at"] = None
+
+            can_retry = retryable and event["attempts"] < event["max_attempts"]
+            if can_retry:
+                event["status"] = "retry_pending"
+                event["next_retry_at"] = retry_at.isoformat()
+            else:
+                event["status"] = "permanently_failed" if retryable else "failed"
+                event["next_retry_at"] = None
+
+            return self._to_integration_event(event)
+
+        return await self.store.update(mutator)
+
+    async def get_integration_event(
+        self,
+        event_id: str,
+        default_max_attempts: int = 1,
+    ) -> IntegrationEventRead | None:
+        data = await self.store.load()
+        event = self._find_integration_event(data, event_id)
+        if event is None:
+            return None
+        self._ensure_integration_event_fields(event, default_max_attempts)
+        return self._to_integration_event(event)
+
+    async def due_retry_events(
+        self,
+        default_max_attempts: int = 1,
+        now: datetime | None = None,
+    ) -> list[IntegrationEventRead]:
+        data = await self.store.load()
+        now_value = now or now_utc()
+        result: list[IntegrationEventRead] = []
+        for event in data["integration_events"]:
+            self._ensure_integration_event_fields(event, default_max_attempts)
+            if event["event_type"] != ErpEventType.customer_order_complete.value:
+                continue
+            if event["status"] != "retry_pending":
+                continue
+            if event["attempts"] >= event["max_attempts"]:
+                continue
+
+            next_retry_at = event.get("next_retry_at")
+            if not next_retry_at or self._parse_datetime(next_retry_at) <= now_value:
+                result.append(self._to_integration_event(event))
+        return result
 
     async def list_integration_events(self) -> list[IntegrationEventRead]:
         data = await self.store.load()
@@ -254,6 +348,28 @@ class OrderService:
             "completed": sum(recipe["completed"] for recipe in order["recipes"].values()),
         }
 
+    def _find_integration_event(self, data: dict[str, Any], event_id: str) -> dict[str, Any] | None:
+        for event in data["integration_events"]:
+            if event["id"] == event_id:
+                return event
+        return None
+
+    def _ensure_integration_event_fields(
+        self,
+        event: dict[str, Any],
+        default_max_attempts: int = 1,
+    ) -> None:
+        event.setdefault("attempts", 0)
+        event.setdefault("last_attempt_at", None)
+        event.setdefault("next_retry_at", None)
+        event.setdefault("max_attempts", default_max_attempts)
+
+    def _parse_datetime(self, value: str) -> datetime:
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed
+
     def _to_order_read(self, order: dict[str, Any]) -> LoadedOrderRead:
         totals = self._order_totals(order)
         recipes = {
@@ -278,6 +394,7 @@ class OrderService:
         )
 
     def _to_integration_event(self, event: dict[str, Any]) -> IntegrationEventRead:
+        self._ensure_integration_event_fields(event)
         return IntegrationEventRead(
             id=event["id"],
             event_type=ErpEventType(event["event_type"]),
@@ -286,4 +403,8 @@ class OrderService:
             created_at=datetime.fromisoformat(event["created_at"]),
             sent_at=datetime.fromisoformat(event["sent_at"]) if event.get("sent_at") else None,
             error=event.get("error"),
+            attempts=event["attempts"],
+            last_attempt_at=datetime.fromisoformat(event["last_attempt_at"]) if event.get("last_attempt_at") else None,
+            next_retry_at=datetime.fromisoformat(event["next_retry_at"]) if event.get("next_retry_at") else None,
+            max_attempts=event["max_attempts"],
         )

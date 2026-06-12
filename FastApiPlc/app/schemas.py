@@ -194,3 +194,7 @@ class IntegrationEventRead(BaseModel):
     created_at: datetime
     sent_at: datetime | None = None
     error: str | None = None
+    attempts: int = 0
+    last_attempt_at: datetime | None = None
+    next_retry_at: datetime | None = None
+    max_attempts: int = 1

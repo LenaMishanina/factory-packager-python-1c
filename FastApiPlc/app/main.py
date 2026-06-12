@@ -45,22 +45,27 @@ def create_app(
     plc: Any | None = None,
     erp_client: ErpClient | None = None,
     start_polling: bool | None = None,
+    start_retry: bool | None = None,
+    retry_interval_seconds: int | None = None,
+    retry_max_attempts: int | None = None,
 ) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         sync_counter_baseline(app)
         if app.state.start_polling:
             app.state.polling_task = asyncio.create_task(plc_polling_loop(app))
+        if app.state.start_retry:
+            app.state.retry_task = asyncio.create_task(erp_retry_loop(app))
         try:
             yield
         finally:
-            task = app.state.polling_task
-            if task:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
+            for task in (app.state.polling_task, app.state.retry_task):
+                if task:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
 
     app = FastAPI(
         title="Factory Packager PLC API",
@@ -83,8 +88,22 @@ def create_app(
     app.state.last_finished_counter = 0
     app.state.last_reject_counter = 0
     app.state.polling_task = None
+    app.state.retry_task = None
+    app.state.retry_interval_seconds = (
+        retry_interval_seconds
+        if retry_interval_seconds is not None
+        else int(os.getenv("ERP_RETRY_INTERVAL_SECONDS", "10"))
+    )
+    app.state.retry_max_attempts = (
+        retry_max_attempts
+        if retry_max_attempts is not None
+        else int(os.getenv("ERP_RETRY_MAX_ATTEMPTS", "10"))
+    )
     app.state.start_polling = (
         start_polling if start_polling is not None else os.getenv("PLC_POLLING_ENABLED", "false").lower() == "true"
+    )
+    app.state.start_retry = (
+        start_retry if start_retry is not None else os.getenv("ERP_RETRY_ENABLED", "true").lower() == "true"
     )
 
     @app.get("/", tags=["System"], response_model=ApiResponse, summary="Проверить запуск API")
@@ -228,6 +247,29 @@ def create_app(
             data={"events": await service.list_integration_events()},
         )
 
+    @app.post(
+        "/integration/events/{event_id}/retry",
+        tags=["Integration"],
+        response_model=ApiResponse,
+        summary="Retry integration event delivery",
+    )
+    async def retry_integration_event(event_id: str, request: Request) -> ApiResponse | JSONResponse:
+        service: OrderService = request.app.state.order_service
+        event = await service.get_integration_event(event_id, request.app.state.retry_max_attempts)
+        if event is None:
+            return error_response(status.HTTP_404_NOT_FOUND, "Integration event not found")
+        if event.event_type != ErpEventType.customer_order_complete:
+            return error_response(status.HTTP_400_BAD_REQUEST, "Only customer_order_complete events can be retried")
+        if event.status not in {"failed", "retry_pending", "permanently_failed"}:
+            return error_response(status.HTTP_409_CONFLICT, f"Event status '{event.status}' cannot be retried")
+
+        result = await send_existing_erp_event(request.app, event.id)
+        return ApiResponse(
+            success=True,
+            message="Integration event retry processed",
+            data={"event": result},
+        )
+
     return app
 
 
@@ -291,16 +333,68 @@ async def process_reject_tray(app: FastAPI) -> None:
 
 async def dispatch_erp_event(app: FastAPI, event_type: ErpEventType, payload: dict[str, Any]) -> dict[str, Any]:
     service: OrderService = app.state.order_service
-    event = await service.create_integration_event(event_type, payload)
+    max_attempts = app.state.retry_max_attempts if is_retryable_event(event_type) else 1
+    event = await service.create_integration_event(event_type, payload, max_attempts=max_attempts)
+    return await send_existing_erp_event(app, event.id)
+
+
+async def send_existing_erp_event(app: FastAPI, event_id: str) -> dict[str, Any]:
+    service: OrderService = app.state.order_service
+    event = await service.register_integration_attempt(event_id, app.state.retry_max_attempts)
+    if event is None:
+        return {"id": event_id, "status": "not_found", "error": "Integration event not found"}
+
     try:
-        result = await app.state.erp_client.send_event(event_type, payload)
-    except Exception as exc:  # pragma: no cover - network behavior depends on the local ERP publication
-        await service.mark_integration_event(event.id, "failed", str(exc))
-        return {"id": event.id, "status": "failed", "error": str(exc)}
+        result = await app.state.erp_client.send_event(event.event_type, event.payload)
+    except Exception as exc:
+        updated_event = await service.mark_integration_event_failed(
+            event.id,
+            str(exc),
+            retryable=is_retryable_event(event.event_type),
+            retry_interval_seconds=app.state.retry_interval_seconds,
+        )
+        return event_result(updated_event or event, error=str(exc))
 
     status_value = "skipped" if result.get("status") == "skipped" else "sent"
-    await service.mark_integration_event(event.id, status_value)
-    return {"id": event.id, "status": status_value, "response": result}
+    updated_event = await service.mark_integration_event_sent(event.id, status_value)
+    return event_result(updated_event or event, response=result)
+
+
+def is_retryable_event(event_type: ErpEventType) -> bool:
+    return event_type == ErpEventType.customer_order_complete
+
+
+def event_result(
+    event: Any,
+    *,
+    response: dict[str, Any] | None = None,
+    error: str | None = None,
+) -> dict[str, Any]:
+    result = {
+        "id": event.id,
+        "status": event.status,
+        "attempts": event.attempts,
+        "max_attempts": event.max_attempts,
+        "next_retry_at": event.next_retry_at.isoformat() if event.next_retry_at else None,
+    }
+    if response is not None:
+        result["response"] = response
+    if error is not None:
+        result["error"] = error
+    return result
+
+
+async def erp_retry_loop(app: FastAPI) -> None:
+    while True:
+        await asyncio.sleep(app.state.retry_interval_seconds)
+        service: OrderService = app.state.order_service
+        due_events = await service.due_retry_events(app.state.retry_max_attempts)
+        for event in due_events:
+            try:
+                await send_existing_erp_event(app, event.id)
+            except Exception:
+                # Keep the loop alive; send_existing_erp_event records expected ERP/network errors.
+                continue
 
 
 async def plc_polling_loop(app: FastAPI) -> None:
